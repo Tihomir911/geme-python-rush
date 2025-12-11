@@ -1,0 +1,475 @@
+# python_rush_final.py
+# Python Rush — финальная версия
+
+import pygame
+import sys
+import random
+import numpy as np
+from pygame import Rect
+
+# ---------------- INIT ----------------
+pygame.init()
+try:
+    pygame.mixer.init()
+except Exception:
+    pass
+
+pygame.display.set_caption("Python Rush — Final Edition")
+
+WINDOW_SIZE = 500
+UI_TOP = 64
+FPS = 60
+
+# цвета
+COLOR_BG = (18, 18, 20)
+COLOR_CELL = (28, 28, 30)
+COLOR_CELL_BORDER = (60, 60, 64)
+PYTHON_YELLOW = (255, 203, 5)
+PYTHON_BLUE = (31, 110, 178)
+TEXT_WHITE = (230, 230, 230)
+TEXT_DIM = (170, 170, 170)
+TEXT_RED = (220, 60, 60)
+BUTTON_BG = (36, 36, 38)
+BUTTON_BORDER = (75, 75, 78)
+PORTAL_BLUE = (80, 140, 255)
+PORTAL_ORANGE = (255, 150, 60)
+
+GRID_CHOICES = {"junior": 30, "midl": 75, "sinior": 90}
+grid_size = GRID_CHOICES["midl"]
+cell_size = max(4, WINDOW_SIZE // grid_size)
+
+screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE + UI_TOP))
+clock = pygame.time.Clock()
+
+FONT_SMALL = pygame.font.SysFont("consolas", 16)
+FONT_MED = pygame.font.SysFont("consolas", 22)
+FONT_BIG = pygame.font.SysFont("consolas", 28)
+
+# UI кнопки
+BUTTON_W = 110
+BUTTON_H = 30
+PADDING = 8
+
+btn_difficulty = Rect(PADDING, 12, BUTTON_W, BUTTON_H)
+btn_play = Rect(PADDING + BUTTON_W + 10, 12, BUTTON_W, BUTTON_H)
+btn_stop = Rect(PADDING + 2*(BUTTON_W + 10), 12, BUTTON_W, BUTTON_H)
+
+# Dropdown
+dropdown_open = False
+dropdown_rects = []
+dropdown_options = [("Лёгкий (junior)", "junior"), ("Средний (midl)", "midl"), ("Сложный (sinior)", "sinior")]
+
+# GAME STATE
+running = False
+paused = False
+game_over = False
+
+start_ticks = 0
+elapsed_before_pause = 0
+
+# snake
+snake = []
+direction = (1, 0)
+next_direction = direction
+snake_grow = 0
+
+# items
+normal_items = set()
+poison_items = set()
+MAX_ITEMS = 10
+
+# portals
+portal_a = None
+portal_b = None
+portal_birth_time = 0
+PORTAL_LIFETIME_MS = 60_000
+next_portal_time = 0
+portal_spawn_cooldown_ms = 60_000
+teleport_cooldown_until = 0
+
+# score
+score = 0
+
+# movement timing
+MOVES_PER_SECOND = 10
+current_mps = MOVES_PER_SECOND
+move_event = pygame.USEREVENT + 1
+
+def update_move_timer():
+    pygame.time.set_timer(move_event, int(1000 / current_mps))
+update_move_timer()
+
+# ---------------- Sounds ----------------
+def make_beep(freq=600, duration_ms=120, volume=0.3):
+    try:
+        sr = 44100
+        t = np.linspace(0, duration_ms/1000, int(sr*duration_ms/1000), False)
+        wave = 0.5 * np.sin(2 * np.pi * freq * t)
+        audio = np.array(wave * 32767 * volume, dtype=np.int16)
+        sound = pygame.sndarray.make_sound(audio)
+        return sound
+    except Exception:
+        return None
+
+snd_eat = make_beep(900, 80, 0.25)
+snd_poison = make_beep(220, 120, 0.25)
+snd_teleport = make_beep(520, 140, 0.28)
+snd_dead = make_beep(120, 350, 0.35)
+
+def play_sound(snd):
+    if snd:
+        try: snd.play()
+        except Exception: pass
+
+# ---------------- Utility ----------------
+def update_cell_size():
+    global cell_size
+    cell_size = max(4, WINDOW_SIZE // grid_size)
+
+def get_taken_set():
+    taken = set(snake)
+    if portal_a: taken.add(portal_a)
+    if portal_b: taken.add(portal_b)
+    taken |= normal_items
+    taken |= poison_items
+    return taken
+
+def get_free_cells():
+    taken = get_taken_set()
+    return [(x, y) for x in range(grid_size) for y in range(grid_size) if (x, y) not in taken]
+
+# ---------------- Spawn logic ----------------
+def spawn_one_item(after_eat=False):
+    global normal_items, poison_items
+    total_items = len(normal_items) + len(poison_items)
+    if total_items >= MAX_ITEMS:
+        return False
+    free = get_free_cells()
+    if not free:
+        return False
+    pos = random.choice(free)
+    if random.random() < 0.75:
+        normal_items.add(pos)
+    else:
+        poison_items.add(pos)
+    return True
+
+def spawn_initial_items():
+    for _ in range(MAX_ITEMS):
+        spawn_one_item(after_eat=False)
+
+def spawn_portals_pair():
+    global portal_a, portal_b, portal_birth_time, next_portal_time
+    free = get_free_cells()
+    if len(free) < 2:
+        return False
+    a,b = random.sample(free,2)
+    portal_a = a
+    portal_b = b
+    portal_birth_time = pygame.time.get_ticks()
+    next_portal_time = portal_birth_time + portal_spawn_cooldown_ms + PORTAL_LIFETIME_MS
+    return True
+
+def clear_portals():
+    global portal_a, portal_b, portal_birth_time
+    portal_a = portal_b = None
+    portal_birth_time = 0
+
+# ---------------- Drawing ----------------
+def draw_glow_circle(center_px, radius, color, pulse=0.0):
+    max_layers = 6
+    for i in range(max_layers):
+        alpha = max(0, 90 - i*12)
+        scale = 1 + i*0.15 + pulse*0.08
+        surf_size = int((radius*2)*(1 + i*0.3 + pulse*0.1))
+        surf = pygame.Surface((surf_size,surf_size), pygame.SRCALPHA)
+        pygame.draw.circle(surf, (*color,int(alpha)), (surf_size//2,surf_size//2), int(radius*scale))
+        screen.blit(surf, (center_px[0]-surf_size//2, center_px[1]-surf_size//2))
+
+def draw_portal(cell,color):
+    if not cell: return
+    cx = cell[0]*cell_size + cell_size//2
+    cy = UI_TOP + cell[1]*cell_size + cell_size//2
+    pulse = ((pygame.time.get_ticks() - portal_birth_time)%1000)/1000.0 if portal_birth_time else 0
+    r = max(4, cell_size//3)
+    draw_glow_circle((cx,cy), r+2, color, pulse=pulse)
+    pygame.draw.circle(screen, color, (cx,cy), r, width=3)
+
+def draw_item_icon(x,y,text):
+    px = x*cell_size
+    py = UI_TOP + y*cell_size
+    size = int(cell_size*0.78)
+    cx = px + (cell_size - size)//2
+    cy = py + (cell_size - size)//2
+    rect = Rect(cx,cy,size,size)
+    pygame.draw.rect(screen, (10,10,10), rect, border_radius=max(2,size//6))
+    inner = rect.inflate(-6,-6)
+    pygame.draw.rect(screen, (80,80,80), inner, border_radius=max(2,size//8))
+    t = FONT_SMALL.render(text, True, (200,200,200))
+    screen.blit(t, t.get_rect(center=inner.center))
+
+def draw_grid():
+    for x in range(grid_size):
+        for y in range(grid_size):
+            px = x*cell_size
+            py = UI_TOP + y*cell_size
+            r = Rect(px,py,cell_size,cell_size)
+            pygame.draw.rect(screen, COLOR_CELL, r)
+            pygame.draw.rect(screen, COLOR_CELL_BORDER, r, 1)
+
+def draw_snake():
+    for i,(x,y) in enumerate(snake):
+        px = x*cell_size
+        py = UI_TOP + y*cell_size
+        r = Rect(px,py,cell_size,cell_size)
+        pad = max(0, cell_size//8)
+        inner = Rect(r.left+pad, r.top+pad, max(1,r.width-2*pad), max(1,r.height-2*pad))
+        if i==0:
+            pygame.draw.rect(screen,PYTHON_YELLOW,inner,border_radius=max(1,pad//2))
+            pygame.draw.rect(screen,PYTHON_BLUE,inner,1,border_radius=max(1,pad//2))
+        else:
+            color = PYTHON_BLUE if i%2==0 else PYTHON_YELLOW
+            pygame.draw.rect(screen,color,inner,border_radius=max(1,pad//2))
+
+def draw_top_ui():
+    panel_rect = Rect(0,0,WINDOW_SIZE,UI_TOP)
+    pygame.draw.rect(screen,COLOR_BG,panel_rect)
+    for rect,label in [(btn_difficulty,"Сложность"),(btn_play,"Играть"),(btn_stop,"Стоп")]:
+        pygame.draw.rect(screen,BUTTON_BG,rect,border_radius=6)
+        pygame.draw.rect(screen,BUTTON_BORDER,rect,1,border_radius=6)
+        txt = FONT_SMALL.render(label, True, TEXT_WHITE)
+        screen.blit(txt, txt.get_rect(center=rect.center))
+
+    # timer
+    elapsed_ms = elapsed_before_pause
+    if running and not paused and not game_over:
+        elapsed_ms = pygame.time.get_ticks() - start_ticks + elapsed_before_pause
+    time_str = f"{elapsed_ms//60000:02d}:{(elapsed_ms//1000)%60:02d}"
+    time_col = TEXT_RED if game_over else TEXT_WHITE
+    time_surf = FONT_BIG.render(time_str, True, time_col)
+    screen.blit(time_surf, time_surf.get_rect(center=(WINDOW_SIZE//2,UI_TOP//2)))
+
+    # score
+    score_x = WINDOW_SIZE//2 + 140
+    icon_rect = Rect(score_x,(UI_TOP-24)//2,24,24)
+    pygame.draw.rect(screen,(10,10,10),icon_rect,border_radius=6)
+    inner = icon_rect.inflate(-6,-6)
+    pygame.draw.rect(screen,(80,80,80),inner,border_radius=4)
+    t = FONT_SMALL.render("</>",True,(200,200,200))
+    screen.blit(t,t.get_rect(center=inner.center))
+    score_s = FONT_MED.render(str(score), True, TEXT_WHITE)
+    screen.blit(score_s, (icon_rect.right + 8, icon_rect.top))
+
+    # portal timer
+    if portal_a and portal_b and portal_birth_time:
+        remain = max(0, PORTAL_LIFETIME_MS - (pygame.time.get_ticks() - portal_birth_time))
+        ptxt = FONT_SMALL.render(f"Portals: {remain//1000}s", True, (180,180,255))
+        screen.blit(ptxt,(WINDOW_SIZE-160,8))
+
+    # dropdown
+    if dropdown_open:
+        global dropdown_rects
+        dropdown_rects = []
+        dx = btn_difficulty.left
+        dy = btn_difficulty.bottom+6
+        w,h = 220,30
+        for i,(label,key) in enumerate(dropdown_options):
+            r = Rect(dx,dy+i*(h+4),w,h)
+            dropdown_rects.append((r,key))
+            pygame.draw.rect(screen,BUTTON_BG,r,border_radius=6)
+            pygame.draw.rect(screen,BUTTON_BORDER,r,1,border_radius=6)
+            t = FONT_SMALL.render(label,True,TEXT_WHITE)
+            screen.blit(t,t.get_rect(center=r.center))
+
+# ---------------- Teleport ----------------
+def try_teleport(pos):
+    global teleport_cooldown_until
+    now = pygame.time.get_ticks()
+    if now < teleport_cooldown_until:
+        return pos
+    if portal_a and portal_b:
+        if pos==portal_a: dest=portal_b
+        elif pos==portal_b: dest=portal_a
+        else: return pos
+        snake_set = set(snake)
+        if dest in snake_set:
+            for dx,dy in [(1,0),(-1,0),(0,1),(0,-1)]:
+                cand=(dest[0]+dx,dest[1]+dy)
+                if 0<=cand[0]<grid_size and 0<=cand[1]<grid_size and cand not in snake_set and cand not in normal_items and cand not in poison_items:
+                    dest=cand
+                    break
+            else: return pos
+        teleport_cooldown_until = now + 300
+        play_sound(snd_teleport)
+        return dest
+    return pos
+
+# ---------------- Movement ----------------
+def stop_timer_on_game_over():
+    global elapsed_before_pause
+    elapsed_before_pause = pygame.time.get_ticks() - start_ticks + elapsed_before_pause
+
+def apply_poison_effect():
+    global score,snake
+    score -= 5
+    if score<0: score=0
+    for _ in range(2):
+        if len(snake)>1: snake.pop()
+
+def move_snake_step():
+    global snake, game_over, score, snake_grow
+    if not running or paused or game_over: return
+    head=snake[0]
+    new_head=(head[0]+direction[0], head[1]+direction[1])
+
+    if not (0<=new_head[0]<grid_size and 0<=new_head[1]<grid_size):
+        game_over=True
+        play_sound(snd_dead)
+        stop_timer_on_game_over()
+        return
+
+    if new_head in snake:
+        game_over=True
+        play_sound(snd_dead)
+        stop_timer_on_game_over()
+        return
+
+    new_head=try_teleport(new_head)
+    snake.insert(0,new_head)
+
+    if new_head in normal_items:
+        normal_items.remove(new_head)
+        score+=1
+        snake_grow+=1
+        play_sound(snd_eat)
+        spawn_one_item(after_eat=True)
+
+    elif new_head in poison_items:
+        poison_items.remove(new_head)
+        apply_poison_effect()
+        play_sound(snd_poison)
+        spawn_one_item(after_eat=True)
+
+    if snake_grow>0: snake_grow-=1
+    else:
+        if len(snake)>1: snake.pop()
+
+    # check if no free cells -> game over
+    if not get_free_cells():
+        game_over=True
+        play_sound(snd_dead)
+        stop_timer_on_game_over()
+
+# ---------------- Game reset ----------------
+def reset_game():
+    global snake, direction, next_direction, snake_grow, normal_items, poison_items
+    global score, start_ticks, elapsed_before_pause, running, paused, game_over
+    global portal_a, portal_b, next_portal_time, portal_birth_time, teleport_cooldown_until
+
+    snake=[(grid_size//2,grid_size//2),(grid_size//2-1,grid_size//2)]
+    direction=(1,0)
+    next_direction=direction
+    snake_grow=0
+
+    normal_items=set()
+    poison_items=set()
+
+    clear_portals()
+    portal_birth_time=0
+    teleport_cooldown_until=0
+    next_portal_time=pygame.time.get_ticks() + portal_spawn_cooldown_ms
+
+    score=0
+    start_ticks=pygame.time.get_ticks()
+    elapsed_before_pause=0
+    running=True
+    paused=False
+    game_over=False
+
+    # spawn exactly MAX_ITEMS at start
+    spawn_initial_items()
+
+# ---------------- Draw everything ----------------
+def draw_everything():
+    screen.fill(COLOR_BG)
+    draw_grid()
+    if portal_a: draw_portal(portal_a, PORTAL_BLUE)
+    if portal_b: draw_portal(portal_b, PORTAL_ORANGE)
+    for (x,y) in normal_items: draw_item_icon(x,y,"</>")
+    for (x,y) in poison_items: draw_item_icon(x,y,"c++")
+    draw_snake()
+    draw_top_ui()
+    pygame.display.flip()
+
+# ---------------- Main ----------------
+update_cell_size()
+reset_game()
+update_move_timer()
+
+while True:
+    now = pygame.time.get_ticks()
+    if portal_a and portal_b:
+        if now - portal_birth_time > PORTAL_LIFETIME_MS:
+            clear_portals()
+            next_portal_time=now + portal_spawn_cooldown_ms
+    else:
+        if now >= next_portal_time:
+            spawn_portals_pair()
+
+    for event in pygame.event.get():
+        if event.type==pygame.QUIT:
+            pygame.quit(); sys.exit()
+        elif event.type==pygame.MOUSEBUTTONDOWN and event.button==1:
+            mx,my=event.pos
+            if btn_difficulty.collidepoint(mx,my):
+                dropdown_open=not dropdown_open
+            elif btn_play.collidepoint(mx,my):
+                update_cell_size()
+                reset_game()
+            elif btn_stop.collidepoint(mx,my):
+                if running and not game_over:
+                    paused=not paused
+                    if paused:
+                        elapsed_before_pause += pygame.time.get_ticks() - start_ticks
+                    else:
+                        start_ticks = pygame.time.get_ticks()
+                dropdown_open=False
+            else:
+                if dropdown_open:
+                    for r,key in dropdown_rects:
+                        if r.collidepoint(mx,my):
+                            grid_size=GRID_CHOICES[key]
+                            update_cell_size()
+                            dropdown_open=False
+                            reset_game()
+                            break
+                    else: dropdown_open=False
+        elif event.type==pygame.KEYDOWN:
+            if event.key in (pygame.K_w,pygame.K_UP):
+                if direction!=(0,1): next_direction=(0,-1)
+            elif event.key in (pygame.K_s,pygame.K_DOWN):
+                if direction!=(0,-1): next_direction=(0,1)
+            elif event.key in (pygame.K_a,pygame.K_LEFT):
+                if direction!=(1,0): next_direction=(-1,0)
+            elif event.key in (pygame.K_d,pygame.K_RIGHT):
+                if direction!=(-1,0): next_direction=(1,0)
+            if event.key==pygame.K_SPACE:
+                if running and not game_over:
+                    paused=not paused
+                    if paused: elapsed_before_pause += pygame.time.get_ticks()-start_ticks
+                    else: start_ticks=pygame.time.get_ticks()
+            if event.key in (pygame.K_LSHIFT,pygame.K_RSHIFT):
+                current_mps=MOVES_PER_SECOND*2
+                update_move_timer()
+        elif event.type==pygame.KEYUP:
+            if event.key in (pygame.K_LSHIFT,pygame.K_RSHIFT):
+                current_mps=MOVES_PER_SECOND
+                update_move_timer()
+        elif event.type==move_event:
+            if running and not paused and not game_over:
+                if (next_direction[0]+direction[0],next_direction[1]+direction[1])!=(0,0):
+                    direction=next_direction
+                move_snake_step()
+
+    draw_everything()
+    clock.tick(FPS)
