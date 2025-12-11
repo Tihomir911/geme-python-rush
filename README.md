@@ -1,4 +1,4 @@
-# Python Rush 🐍
+# Python Rush 🐍.
 
 A modern twist on the classic Snake game with programming-themed elements, portals, and dynamic challenges.
 
