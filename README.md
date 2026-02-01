@@ -2,8 +2,6 @@
 
 A modern twist on the classic Snake game with programming-themed elements, portals, and dynamic challenges.
 
-![Game Screenshot](https://via.placeholder.com/500x300/121214/FFFFFF?text=Python+Rush+Gameplay)
-
 ## 🎮 Features
 
 ### Core Gameplay
